@@ -1,5 +1,7 @@
 import { getLocalizedErrorMessage } from '@/constants/backend-error-messages';
 import { api_base } from '@/external/bot-skeleton';
+import { streamContractUntilSettled } from '@/utils/trade-purchase';
+import { safeSubscribe } from '@/utils/websocket-handler';
 
 /**
  * Deriv's copy trading works on the currently authenticated (follower's own)
@@ -114,6 +116,62 @@ export const stopCopyTrading = async (trader_token: string): Promise<TCopyTradin
     } catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : 'Could not stop copy trading.' };
     }
+};
+
+export type TCopiedTransactionCallbacks = {
+    /** Fired the moment Deriv reports a new buy on the account — before it settles. */
+    onBuy?: (snapshot: Record<string, any>) => void;
+    /** Fired once that copied contract settles (won or lost). */
+    onSettled?: (snapshot: Record<string, any>) => void;
+};
+
+/**
+ * Copy Trading executes on Deriv's backend directly onto the follower's own
+ * account — the app never receives a `buy` response for these trades the
+ * way Manual/Bulk Trading do (there's no `copy_start` "buy result" to read).
+ * The only way to know a copied trade happened at all is to watch the
+ * account's own `transaction` stream, which reports every buy/sell on the
+ * account, and thread each new contract through the same settlement
+ * tracking used everywhere else so it shows up in Trade History with a
+ * Won/Lost result.
+ *
+ * Callers should start this while at least one trader is being followed,
+ * and stop it (call the returned function) once no traders remain.
+ */
+export const watchCopiedTransactions = (callbacks: TCopiedTransactionCallbacks) => {
+    const seen_contract_ids = new Set<number>();
+
+    const observable = (api_base.api as any)?.subscribe?.({ transaction: 1, subscribe: 1 });
+    const subscription = safeSubscribe(observable, (data: any) => {
+        const transaction = data?.transaction;
+        if (!transaction || transaction.action !== 'buy' || !transaction.contract_id) return;
+        if (seen_contract_ids.has(transaction.contract_id)) return;
+        seen_contract_ids.add(transaction.contract_id);
+
+        const fallback = {
+            buy_price: Math.abs(Number(transaction.amount ?? 0)),
+            contract_id: transaction.contract_id,
+            currency: transaction.currency,
+            date_start: transaction.purchase_time ?? transaction.transaction_time,
+            display_name: transaction.symbol,
+            shortcode: transaction.longcode,
+            underlying_symbol: transaction.symbol,
+            transaction_ids: { buy: transaction.transaction_id },
+        };
+
+        callbacks.onBuy?.(fallback);
+
+        void streamContractUntilSettled({
+            contractId: transaction.contract_id,
+            fallback,
+            source: 'Copy Trading',
+        }).then(settled => callbacks.onSettled?.(settled));
+    });
+
+    return () => {
+        subscription?.unsubscribe?.();
+        seen_contract_ids.clear();
+    };
 };
 
 /** Lists traders the current account is copying, and copiers following it. */

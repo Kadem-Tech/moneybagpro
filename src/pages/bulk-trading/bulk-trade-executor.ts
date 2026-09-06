@@ -1,6 +1,6 @@
 import { getDomainConfig } from '@/components/shared';
 import { getSymbolRequestField } from '@/external/bot-skeleton/services/api/legacy-request';
-import { buyContractForUi, normalizeTradeParameters } from '@/utils/trade-purchase';
+import { buyContractForUi, normalizeTradeParameters, streamContractUntilSettled } from '@/utils/trade-purchase';
 
 const LEGACY_WS_SERVER = 'wss://ws.derivws.com/websockets/v3';
 const RESPONSE_TIMEOUT_MS = 15000;
@@ -28,7 +28,14 @@ export type TBulkTradeResult = {
     buy_price?: number;
     payout?: number;
     contract_id?: number;
+    /** Populated once the contract settles on that account's own connection. */
+    profit?: number;
+    is_sold?: boolean;
+    won?: boolean;
 };
+
+/** How long to wait, per account, for a fired contract to settle before giving up on the result (not the trade itself — it already went through). */
+const SETTLEMENT_TIMEOUT_MS = 120000;
 
 /**
  * Reads the linked-accounts token map that Deriv's OAuth redirect stores in
@@ -116,6 +123,53 @@ const openSocket = (): Promise<WebSocket> =>
         };
     });
 
+/**
+ * Waits for a contract bought on an isolated per-account socket to settle,
+ * by subscribing to proposal_open_contract on that same socket (the app's
+ * shared `streamContractUntilSettled` can't be reused here — it only knows
+ * about the main session's own connection, not these other accounts').
+ * Resolves with `is_sold: false` on timeout rather than rejecting, since the
+ * trade itself already succeeded — a missing result shouldn't be reported
+ * as a failed purchase.
+ */
+const waitForContractSettlement = (
+    socket: WebSocket,
+    contractId: number,
+    timeoutMs: number
+): Promise<{ is_sold: boolean; profit?: number; status?: string }> =>
+    new Promise(resolve => {
+        let settled = false;
+
+        const finish = (result: { is_sold: boolean; profit?: number; status?: string }) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            socket.removeEventListener('message', onMessage);
+            resolve(result);
+        };
+
+        const timeout = setTimeout(() => finish({ is_sold: false }), timeoutMs);
+
+        const onMessage = (event: MessageEvent) => {
+            let data: any;
+            try {
+                data = JSON.parse(event.data);
+            } catch {
+                return;
+            }
+            const contract = data?.proposal_open_contract;
+            if (data?.msg_type !== 'proposal_open_contract' || !contract) return;
+            if (Number(contract.contract_id) !== Number(contractId)) return;
+
+            if (contract.is_sold) {
+                finish({ is_sold: true, profit: Number(contract.profit ?? 0), status: contract.status });
+            }
+        };
+
+        socket.addEventListener('message', onMessage);
+        socket.send(JSON.stringify({ proposal_open_contract: 1, contract_id: contractId, subscribe: 1 }));
+    });
+
 const buildTradeRequestParameters = (trade: TBulkTradeParameters, webSocketURL?: string) => {
     // Mode 1 (executeTradeOnAccount) always connects over its own dedicated
     // legacy socket (LEGACY_WS_SERVER, /websockets/v3), independent of
@@ -186,13 +240,22 @@ export const executeTradeOnAccount = async (
         }
 
         const buy = buy_response.buy;
+        const settlement = buy?.contract_id
+            ? await waitForContractSettlement(socket, buy.contract_id, SETTLEMENT_TIMEOUT_MS)
+            : { is_sold: false as const };
+
         return {
             loginid: account.loginid,
             ok: true,
-            message: 'Purchased.',
+            message: settlement.is_sold
+                ? `${(settlement.profit ?? 0) >= 0 ? 'Won' : 'Lost'} ${Math.abs(settlement.profit ?? 0).toFixed(2)}`
+                : 'Purchased · result still pending.',
             buy_price: Number(buy?.buy_price),
             payout: Number(buy?.payout),
             contract_id: buy?.contract_id,
+            profit: settlement.profit,
+            is_sold: settlement.is_sold,
+            won: settlement.is_sold ? (settlement.profit ?? 0) >= 0 : undefined,
         };
     } catch (error) {
         return { loginid: account.loginid, ok: false, message: error instanceof Error ? error.message : 'Unknown error.' };
@@ -210,21 +273,69 @@ export const runBulkTradeAcrossAccounts = async (
     trade: TBulkTradeParameters
 ): Promise<TBulkTradeResult[]> => Promise.all(accounts.map(account => executeTradeOnAccount(account, trade)));
 
+export type TBulkBatchCallbacks = {
+    /** Fired the instant a trade in the batch is bought, before it settles — for pushing into Trade History right away. */
+    onBuy?: (trade_id: string, snapshot: Record<string, any>) => void;
+    /** Fired once that trade's contract settles (won or lost) — for updating Trade History with the final result. */
+    onSettled?: (trade_id: string, snapshot: Record<string, any>) => void;
+};
+
+export type TBulkBatchResult = {
+    ok: boolean;
+    message: string;
+    profit?: number;
+    won?: boolean;
+};
+
 /**
  * Mode 2: fire several different trades on the single account the user is
  * currently authorized on in the main app. Reuses the same purchase path as
- * Manual Trading (`buyContractForUi`) so behaviour — proposal, balance
- * checks, error messages — stays identical to a normal single trade.
+ * Manual Trading (`buyContractForUi` + `streamContractUntilSettled`) so
+ * behaviour — proposal, balance checks, error messages, settlement, and
+ * Trade History visibility — stays identical to a normal single trade.
  */
 export const runBulkTradesOnActiveAccount = async (
-    trades: (TBulkTradeParameters & { id: string })[]
-): Promise<Record<string, { ok: boolean; message: string }>> => {
+    trades: (TBulkTradeParameters & { id: string })[],
+    callbacks?: TBulkBatchCallbacks
+): Promise<Record<string, TBulkBatchResult>> => {
     const entries = await Promise.all(
         trades.map(async trade => {
             try {
                 const parameters = buildTradeRequestParameters(trade);
-                await buyContractForUi({ parameters, price: trade.stake, source: 'Bulk Trading' });
-                return [trade.id, { ok: true, message: 'Purchased.' }] as const;
+                const fallback = {
+                    buy_price: trade.stake,
+                    date_start: Math.floor(Date.now() / 1000),
+                    underlying_symbol: trade.symbol,
+                    shortcode: `BULK_${trade.contract_type}_${trade.symbol}`,
+                    contract_type: trade.contract_type,
+                };
+
+                const buy = await buyContractForUi({ parameters, price: trade.stake, source: 'Bulk Trading' });
+                const buySnapshot = {
+                    ...fallback,
+                    buy_price: buy.buy_price,
+                    contract_id: buy.contract_id,
+                    transaction_ids: { buy: buy.transaction_id },
+                };
+                callbacks?.onBuy?.(trade.id, buySnapshot);
+
+                const settled = await streamContractUntilSettled({
+                    contractId: buy.contract_id,
+                    fallback: buySnapshot,
+                    source: 'Bulk Trading',
+                });
+                callbacks?.onSettled?.(trade.id, settled);
+
+                const profit = Number(settled.profit ?? 0);
+                return [
+                    trade.id,
+                    {
+                        ok: true,
+                        message: `${profit >= 0 ? 'Won' : 'Lost'} ${Math.abs(profit).toFixed(2)}`,
+                        profit,
+                        won: profit >= 0,
+                    },
+                ] as const;
             } catch (error) {
                 return [trade.id, { ok: false, message: error instanceof Error ? error.message : 'Unknown error.' }] as const;
             }

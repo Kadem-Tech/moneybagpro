@@ -109,8 +109,21 @@ const TradeFieldsEditor = ({
 const initials = (loginid: string) => loginid.replace(/[0-9]/g, '').slice(0, 2).toUpperCase() || loginid.slice(0, 2).toUpperCase();
 
 const BulkTrading = observer(() => {
-    const { client } = useStore();
+    const { client, run_panel, summary_card, transactions } = useStore();
     const [mode, setMode] = useState<'accounts' | 'batch'>('accounts');
+
+    // Mirrors Manual Trading's pushContract: writes each settled contract
+    // into the app's shared Trade History / Journal so trades placed here
+    // show up there too, instead of only inside this page's own results list.
+    const pushContract = (data: Record<string, any>) => {
+        try {
+            transactions.pushTransaction({ ...data, run_id: run_panel.run_id });
+            run_panel.onBotContractEvent(data);
+            summary_card.onBotContractEvent(data);
+        } catch {
+            // Bulk Trading should not fail because a side panel observer is unavailable.
+        }
+    };
 
     // Mode 1: same trade, several of the user's own linked accounts.
     const linked_accounts = useMemo<TLinkedAccount[]>(() => getLinkedAccounts(), []);
@@ -137,8 +150,9 @@ const BulkTrading = observer(() => {
         setSelectedLoginids(all_selected ? [] : linked_accounts.map(account => account.loginid));
     };
 
-    const accounts_won = accountsResults?.filter(result => result.ok).length ?? 0;
-    const batch_won = batchResults ? Object.values(batchResults).filter(result => result.ok).length : 0;
+    // Only counts trades that actually settled as a win — a successful purchase alone isn't a win.
+    const accounts_won = accountsResults?.filter(result => result.won).length ?? 0;
+    const batch_won = batchResults ? Object.values(batchResults).filter(result => result.won).length : 0;
 
     const handleRunAccounts = async () => {
         const accounts = linked_accounts.filter(account => selectedLoginids.includes(account.loginid));
@@ -160,7 +174,10 @@ const BulkTrading = observer(() => {
         setIsRunningBatch(true);
         setBatchResults(null);
         try {
-            const results = await runBulkTradesOnActiveAccount(batchTrades);
+            const results = await runBulkTradesOnActiveAccount(batchTrades, {
+                onBuy: (_trade_id, snapshot) => pushContract(snapshot),
+                onSettled: (_trade_id, snapshot) => pushContract(snapshot),
+            });
             setBatchResults(results);
         } finally {
             setIsRunningBatch(false);
@@ -277,13 +294,15 @@ const BulkTrading = observer(() => {
                                 <li
                                     key={result.loginid}
                                     className={classNames('bulk-trading__result', {
-                                        'bulk-trading__result--ok': result.ok,
-                                        'bulk-trading__result--error': !result.ok,
+                                        'bulk-trading__result--ok': result.won || (result.ok && result.won === undefined),
+                                        'bulk-trading__result--error': !result.ok || result.won === false,
                                     })}
                                 >
-                                    <span className='bulk-trading__result-icon'>{result.ok ? '✓' : '✕'}</span>
+                                    <span className='bulk-trading__result-icon'>
+                                        {result.ok ? (result.won ? '✓' : result.is_sold ? '✕' : '…') : '✕'}
+                                    </span>
                                     <strong>{result.loginid}</strong>
-                                    <span>{result.ok ? `Bought · payout ${result.payout ?? '—'}` : result.message}</span>
+                                    <span>{result.message}</span>
                                 </li>
                             ))}
                         </ul>
@@ -322,8 +341,9 @@ const BulkTrading = observer(() => {
                             {batchResults?.[trade.id] && (
                                 <p
                                     className={classNames('bulk-trading__batch-result', {
-                                        'bulk-trading__result--ok': batchResults[trade.id].ok,
-                                        'bulk-trading__result--error': !batchResults[trade.id].ok,
+                                        'bulk-trading__result--ok': batchResults[trade.id].won,
+                                        'bulk-trading__result--error':
+                                            !batchResults[trade.id].ok || batchResults[trade.id].won === false,
                                     })}
                                 >
                                     {batchResults[trade.id].message}

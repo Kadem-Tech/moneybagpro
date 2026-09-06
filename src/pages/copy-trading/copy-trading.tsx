@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react';
 import classNames from 'classnames';
 import { observer } from 'mobx-react-lite';
+import { useStore } from '@/hooks/useStore';
 import {
     getCopyTradingList,
     getTraderStatistics,
     startCopyTrading,
     stopCopyTrading,
+    watchCopiedTransactions,
     type TCopier,
     type TFollowedTrader,
     type TTraderStatistics,
@@ -17,6 +19,7 @@ const formatPercent = (value?: number) => (typeof value === 'number' ? `${value.
 const formatDate = (epoch?: number) => (epoch ? new Date(epoch * 1000).toLocaleDateString() : '—');
 
 const CopyTrading = observer(() => {
+    const { run_panel, summary_card, transactions } = useStore();
     const [trader_token, setTraderToken] = useState('');
     const [assets_input, setAssetsInput] = useState('');
     const [trade_types_input, setTradeTypesInput] = useState('');
@@ -46,6 +49,35 @@ const CopyTrading = observer(() => {
     useEffect(() => {
         refreshList();
     }, []);
+
+    // Mirrors Manual/Bulk Trading's pushContract: writes each copied
+    // contract into the app's shared Trade History / Journal, so trades
+    // Deriv mirrors onto this account from a followed trader show up there
+    // too — not just as a "Now copying this trader" confirmation message.
+    const pushContract = (data: Record<string, any>) => {
+        try {
+            transactions.pushTransaction({ ...data, run_id: run_panel.run_id });
+            run_panel.onBotContractEvent(data);
+            summary_card.onBotContractEvent(data);
+        } catch {
+            // Copy Trading should not fail because a side panel observer is unavailable.
+        }
+    };
+
+    // Deriv executes copied trades server-side with no local buy response to
+    // react to, so the only way to catch them is to watch the account's own
+    // transaction stream for as long as at least one trader is followed.
+    useEffect(() => {
+        if (traders.length === 0) return undefined;
+
+        const stop = watchCopiedTransactions({
+            onBuy: snapshot => pushContract(snapshot),
+            onSettled: snapshot => pushContract(snapshot),
+        });
+
+        return () => stop();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [traders.length]);
 
     const handleLookup = async () => {
         if (!trader_id_lookup.trim()) return;
