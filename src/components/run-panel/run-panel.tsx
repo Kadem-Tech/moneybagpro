@@ -12,6 +12,7 @@ import Summary from '@/components/summary';
 import TradeAnimation from '@/components/trade-animation';
 import Transactions from '@/components/transactions';
 import { DBOT_TABS } from '@/constants/bot-contents';
+import { run_panel as RUN_PANEL_TABS } from '@/constants/run-panel';
 import { popover_zindex } from '@/constants/z-indexes';
 import { useStore } from '@/hooks/useStore';
 import { Localize, localize } from '@deriv-com/translations';
@@ -197,6 +198,19 @@ const MobileDrawerFooter = () => {
     );
 };
 
+type TMobileHistoryTrigger = { onClick: () => void };
+
+// Manual/Bulk/Copy/Scanner-type pages have their own trade controls, so they
+// don't need the Bot Builder-specific "Execution / Bot is not running" footer
+// (see 3920fef, which correctly stopped that footer overlapping their content).
+// But they still push real trades into the same Transactions store, so this
+// small trigger is how mobile users reach that history without the footer.
+const MobileHistoryTrigger = ({ onClick }: TMobileHistoryTrigger) => (
+    <button type='button' className='run-panel__mobile-history-trigger' onClick={onClick}>
+        <Localize i18n_default_text='Trade history' />
+    </button>
+);
+
 const StatisticsInfoModal = ({
     is_mobile,
     is_statistics_info_modal_open,
@@ -275,7 +289,8 @@ const RunPanel = observer(() => {
     const { statistics } = transactions;
     const { active_tour, active_tab } = dashboard;
     const { total_payout, total_profit, total_stake, won_contracts, lost_contracts, number_of_runs } = statistics;
-    const { BOT_BUILDER } = DBOT_TABS;
+    const { BOT_BUILDER, UP_AND_DOWN } = DBOT_TABS;
+    const is_bot_builder = active_tab === BOT_BUILDER;
 
     React.useEffect(() => {
         onMount();
@@ -318,8 +333,12 @@ const RunPanel = observer(() => {
         />
     );
 
-    // Show run panel on all tabs on desktop, but only on BOT_BUILDER on mobile.
-    const show_run_panel = isDesktop || active_tab === BOT_BUILDER || active_tour;
+    // The drawer (Summary / Transactions / Journal) should be reachable from any
+    // trading tab that can produce a trade — not just Bot Builder — so Trade
+    // History works everywhere. Only the Bot Builder-specific Execution footer
+    // (MobileDrawerFooter) stays restricted below; Up & Down has no trades of
+    // its own to show here, so it's excluded like before.
+    const show_run_panel = isDesktop || active_tab !== UP_AND_DOWN || active_tour;
     if (!show_run_panel || active_tour === 'bot_builder') return null;
 
     return (
@@ -341,7 +360,15 @@ const RunPanel = observer(() => {
                 >
                     {content}
                 </Drawer>
-                {!isDesktop && <MobileDrawerFooter />}
+                {!isDesktop && is_bot_builder && <MobileDrawerFooter />}
+                {!isDesktop && !is_bot_builder && !is_drawer_open && (
+                    <MobileHistoryTrigger
+                        onClick={() => {
+                            setActiveTabIndex(RUN_PANEL_TABS.TRANSACTIONS);
+                            toggleDrawer(true);
+                        }}
+                    />
+                )}
             </div>
 
             <StatisticsInfoModal

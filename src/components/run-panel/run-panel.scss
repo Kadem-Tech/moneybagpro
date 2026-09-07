@@ -816,3 +816,21 @@
         }
     }
 }
+
+// Small floating trigger so non-Bot-Builder mobile pages (Manual/Bulk/Copy
+// Trading, Scanner, etc.) can still reach Trade History, without bringing
+// back the full-width Execution footer that only makes sense for Bot Builder.
+.run-panel__mobile-history-trigger {
+    position: fixed;
+    right: 1.6rem;
+    bottom: calc(2rem + env(safe-area-inset-bottom, 0px));
+    z-index: 90;
+    padding: 0.9rem 1.6rem;
+    border: none;
+    border-radius: 999px;
+    background: var(--run-panel-accent, #ffb300);
+    color: #111827;
+    font-size: 1.2rem;
+    font-weight: 700;
+    box-shadow: 0 0.4rem 1.2rem rgb(0 0 0 / 0.28);
+}
